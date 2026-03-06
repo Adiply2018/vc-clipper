@@ -21,8 +21,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 openai-whisper torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-          pip install ffmpeg-python
+          pip install pyinstaller
+          pip install PyQt6 openai-whisper ffmpeg-python
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
       - name: Download FFmpeg
         run: |
