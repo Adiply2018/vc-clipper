@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+build_venv/
+
+# PyInstaller
+*.spec.bak
+
+# FFmpeg (ビルド時にダウンロード)
+ffmpeg/
+ffmpeg.zip
+ffmpeg_temp/
+
+# IDE
+.idea/
+.vscode/
+*.swp

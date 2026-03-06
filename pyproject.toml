@@ -1,0 +1,20 @@
+[project]
+name = "clipfinder"
+version = "0.1.0"
+description = "ゲーム動画セリフクリッパー - 音声認識でセリフを検索してクリップ"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.5.0",
+    "openai-whisper>=20231117",
+    "torch>=2.0.0",
+    "ffmpeg-python>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+clipfinder = "app:main"
