@@ -3,6 +3,7 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
 
 block_cipher = None
 
@@ -24,11 +25,17 @@ if (ffmpeg_dir / ffmpeg_name).exists():
 if (ffmpeg_dir / ffprobe_name).exists():
     ffmpeg_binaries.append((str(ffmpeg_dir / ffprobe_name), "ffmpeg"))
 
+# PyTorch関連のDLLを収集（c10.dll等のロードエラーを解決）
+torch_datas, torch_binaries, torch_hiddenimports = collect_all('torch')
+
+# ctranslate2のバイナリも収集
+ct2_binaries = collect_dynamic_libs('ctranslate2')
+
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=ffmpeg_binaries,
-    datas=whisper_assets,
+    binaries=ffmpeg_binaries + torch_binaries + ct2_binaries,
+    datas=whisper_assets + torch_datas,
     hiddenimports=[
         'PyQt6.QtCore',
         'PyQt6.QtGui',
@@ -37,7 +44,7 @@ a = Analysis(
         'ctranslate2',
         'torch',
         'ffmpeg',
-    ],
+    ] + torch_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
