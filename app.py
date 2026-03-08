@@ -268,23 +268,56 @@ class DiarizationWorker(QThread):
     finished = pyqtSignal(list)  # [(start, end, speaker_id), ...]
     error = pyqtSignal(str)
 
-    def __init__(self, audio_path: str, hf_token: str, min_speakers: int = None, max_speakers: int = None):
+    # クラス変数でパイプラインをキャッシュ（2回目以降のロードを高速化）
+    _pipeline_cache = None
+    _pipeline_device = None
+    _pipeline_model = None
+
+    def __init__(self, audio_path: str, hf_token: str, min_speakers: int = None, max_speakers: int = None, fast_mode: bool = False):
         super().__init__()
         self.audio_path = audio_path
         self.hf_token = hf_token
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        self.fast_mode = fast_mode
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
+
+    @classmethod
+    def get_pipeline(cls, hf_token: str, device, fast_mode: bool = False):
+        """パイプラインをキャッシュから取得（なければ新規作成）"""
+        from pyannote.audio import Pipeline
+
+        # 使用するモデルを決定
+        model_name = "pyannote/speaker-diarization-3.0" if fast_mode else "pyannote/speaker-diarization-3.1"
+        device_str = str(device)
+
+        # キャッシュが有効か確認
+        if (cls._pipeline_cache is not None and
+            cls._pipeline_device == device_str and
+            cls._pipeline_model == model_name):
+            return cls._pipeline_cache
+
+        # 新規作成
+        pipeline = Pipeline.from_pretrained(model_name, token=hf_token)
+        pipeline.to(device)
+
+        # キャッシュに保存
+        cls._pipeline_cache = pipeline
+        cls._pipeline_device = device_str
+        cls._pipeline_model = model_name
+
+        return pipeline
 
     def run(self):
         try:
             import torch
             from pyannote.audio import Pipeline
 
-            self.progress.emit(10, "話者分離モデルを読み込み中...")
+            model_name = "3.0（高速）" if self.fast_mode else "3.1（高精度）"
+            self.progress.emit(10, f"話者分離: モデル {model_name} を準備中...")
 
             # HF_TOKEN環境変数を設定（pyannote-audio 3.1+で必要）
             if self.hf_token:
@@ -293,17 +326,13 @@ class DiarizationWorker(QThread):
             # GPU/CPU自動選択
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # pyannote-audioパイプライン
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=self.hf_token
-            )
-            pipeline.to(device)
+            # キャッシュからパイプラインを取得
+            pipeline = self.get_pipeline(self.hf_token, device, self.fast_mode)
 
             if self._cancelled:
                 return
 
-            self.progress.emit(30, "話者分離を実行中...")
+            self.progress.emit(30, "話者分離: 音声埋め込み計算中... (1/3)")
 
             # 話者数のヒントを設定
             diarization_params = {}
@@ -312,13 +341,15 @@ class DiarizationWorker(QThread):
             if self.max_speakers is not None:
                 diarization_params["max_speakers"] = self.max_speakers
 
+            self.progress.emit(50, "話者分離: クラスタリング中... (2/3)")
+
             # 話者分離実行
             diarization = pipeline(self.audio_path, **diarization_params)
 
             if self._cancelled:
                 return
 
-            self.progress.emit(80, "話者情報を抽出中...")
+            self.progress.emit(80, "話者分離: ラベル割り当て中... (3/3)")
 
             # 結果を抽出
             segments = []
@@ -505,7 +536,8 @@ class CombinedTranscribeWorker(QThread):
 
     def __init__(self, video_path: str, model_size: str, language: str = "ja",
                  enable_diarization: bool = False, hf_token: str = "",
-                 min_speakers: int = None, max_speakers: int = None):
+                 min_speakers: int = None, max_speakers: int = None,
+                 fast_diarization: bool = False):
         super().__init__()
         self.video_path = video_path
         self.model_size = model_size
@@ -514,6 +546,7 @@ class CombinedTranscribeWorker(QThread):
         self.hf_token = hf_token
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        self.fast_diarization = fast_diarization
         self._cancelled = False
 
         # 結果保存用
@@ -674,11 +707,11 @@ class CombinedTranscribeWorker(QThread):
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=self.hf_token
-            )
-            pipeline.to(device)
+            model_name = "3.0（高速）" if self.fast_diarization else "3.1（高精度）"
+            self.progress.emit(62, f"話者分離: モデル {model_name} を準備中...")
+
+            # キャッシュからパイプラインを取得（DiarizationWorkerのキャッシュを共有）
+            pipeline = DiarizationWorker.get_pipeline(self.hf_token, device, self.fast_diarization)
 
             diarization_params = {}
             if self.min_speakers is not None:
@@ -686,7 +719,12 @@ class CombinedTranscribeWorker(QThread):
             if self.max_speakers is not None:
                 diarization_params["max_speakers"] = self.max_speakers
 
+            self.progress.emit(68, "話者分離: 音声埋め込み計算中... (1/3)")
+            self.progress.emit(75, "話者分離: クラスタリング中... (2/3)")
+
             diarization = pipeline(self._audio_path, **diarization_params)
+
+            self.progress.emit(85, "話者分離: ラベル割り当て中... (3/3)")
 
             segments = []
             for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
@@ -1238,6 +1276,11 @@ class ClipFinderApp(QMainWindow):
         self._diarization_check.stateChanged.connect(self._on_diarization_toggled)
         dg_layout.addWidget(self._diarization_check)
 
+        # 高速モードチェックボックス
+        self._diarization_fast_mode = QCheckBox("高速モード (v3.0)")
+        self._diarization_fast_mode.setToolTip("精度は少し下がりますが、処理速度が向上します")
+        dg_layout.addWidget(self._diarization_fast_mode)
+
         # 話者数ヒント
         speakers_row = QHBoxLayout()
         speakers_row.addWidget(QLabel("話者数"))
@@ -1259,6 +1302,7 @@ class ClipFinderApp(QMainWindow):
         # 初期状態で話者分離設定を無効化
         self._min_speakers_spin.setEnabled(False)
         self._max_speakers_spin.setEnabled(False)
+        self._diarization_fast_mode.setEnabled(False)
 
         layout.addWidget(diarization_group)
 
@@ -1456,6 +1500,7 @@ class ClipFinderApp(QMainWindow):
         enabled = self._diarization_check.isChecked()
         self._min_speakers_spin.setEnabled(enabled)
         self._max_speakers_spin.setEnabled(enabled)
+        self._diarization_fast_mode.setEnabled(enabled)
         self._config.diarization_enabled = enabled
 
     # ── イベントハンドラ ──────────────────────
@@ -1518,13 +1563,15 @@ class ClipFinderApp(QMainWindow):
         enable_diarization = self._diarization_check.isChecked()
         min_speakers = self._min_speakers_spin.value() if self._min_speakers_spin.value() > 0 else None
         max_speakers = self._max_speakers_spin.value() if self._max_speakers_spin.value() > 0 else None
+        fast_diarization = self._diarization_fast_mode.isChecked()
 
         self._transcribe_worker = CombinedTranscribeWorker(
             self._video_path, model_key, lang or "ja",
             enable_diarization=enable_diarization,
             hf_token=HF_TOKEN,  # 固定トークン使用
             min_speakers=min_speakers,
-            max_speakers=max_speakers
+            max_speakers=max_speakers,
+            fast_diarization=fast_diarization
         )
         self._diarization_pending = enable_diarization  # 話者分離待ちフラグ
         self._transcribe_worker.progress.connect(self._on_transcribe_progress)
