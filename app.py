@@ -5,6 +5,12 @@ ClipFinder - ゲーム動画セリフクリッパー
 
 import sys
 import os
+
+# UTF-8を強制
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+os.environ.setdefault('LANG', 'en_US.UTF-8')
+if sys.platform == 'win32':
+    os.environ.setdefault('PYTHONUTF8', '1')
 import json
 import threading
 import subprocess
@@ -66,29 +72,36 @@ class TranscribeWorker(QThread):
 
     def run(self):
         try:
-            import whisper
+            from faster_whisper import WhisperModel
             import torch
 
             self.progress.emit(5, "モデルを読み込み中...")
 
-            # GPU自動選択
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # GPU/CPU自動選択
+            if torch.cuda.is_available():
+                device = "cuda"
+                compute_type = "float16"
+            else:
+                device = "cpu"
+                compute_type = "int8"  # CPUではint8で高速化
+
             actual_model = self.model_size
             if self.model_size == "auto":
-                actual_model = "large" if torch.cuda.is_available() else "medium"
+                actual_model = "large-v3" if torch.cuda.is_available() else "medium"
 
-            self.progress.emit(15, f"Whisper {actual_model} ({device}) で認識開始...")
+            self.progress.emit(15, f"Whisper {actual_model} ({device}, {compute_type}) で認識開始...")
 
-            model = whisper.load_model(actual_model, device=device)
+            model = WhisperModel(actual_model, device=device, compute_type=compute_type)
 
             if self._cancelled:
                 return
 
             self.progress.emit(30, "音声を抽出中...")
 
-            # 一時WAVファイルに音声抽出
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
+            # 一時WAVファイルに音声抽出（ASCII文字のみのパスを使用）
+            import uuid
+            tmp_dir = "/tmp" if platform.system() != "Windows" else tempfile.gettempdir()
+            tmp_path = os.path.join(tmp_dir, f"clipfinder_{uuid.uuid4().hex}.wav")
 
             cmd = [
                 get_ffmpeg_path(), "-y", "-i", self.video_path,
@@ -96,7 +109,7 @@ class TranscribeWorker(QThread):
                 "-ar", "16000", "-ac", "1",
                 tmp_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
             if result.returncode != 0:
                 raise RuntimeError(f"FFmpeg エラー: {result.stderr}")
 
@@ -104,46 +117,55 @@ class TranscribeWorker(QThread):
                 os.unlink(tmp_path)
                 return
 
-            self.progress.emit(50, "音声認識中（時間がかかります）...")
+            self.progress.emit(50, "音声認識中...")
 
-            result = model.transcribe(
-                tmp_path,
+            # 音声をnumpy配列として読み込んでPyAVのパス問題を回避
+            import numpy as np
+            import wave
+            with wave.open(tmp_path, 'rb') as wf:
+                audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                audio_float = audio_data.astype(np.float32) / 32768.0
+
+            os.unlink(tmp_path)  # 早めに削除
+
+            # faster-whisperはジェネレータを返す
+            segment_generator, info = model.transcribe(
+                audio_float,
                 language=self.language,
                 word_timestamps=True,
-                verbose=False
+                vad_filter=True,  # 無音部分をスキップして高速化
             )
 
-            os.unlink(tmp_path)
-
-            if self._cancelled:
-                return
-
             segments = []
-            total = len(result["segments"])
-            for i, seg in enumerate(result["segments"]):
+            for i, seg in enumerate(segment_generator):
                 if self._cancelled:
                     break
                 segment_data = {
                     "id": i,
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": seg["text"].strip(),
+                    "start": seg.start,
+                    "end": seg.end,
+                    "text": seg.text.strip(),
                 }
                 segments.append(segment_data)
                 self.segment_ready.emit(segment_data)
+                self.progress.emit(60, f"認識中... {i+1} セグメント")
 
-                pct = 50 + int((i / max(total, 1)) * 45)
-                self.progress.emit(pct, f"認識中... ({i+1}/{total})")
+            if self._cancelled:
+                return
 
             self.progress.emit(100, "完了")
             self.finished.emit(segments)
 
-        except ImportError:
+        except ImportError as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(
-                "whisper が見つかりません。\n"
-                "pip install openai-whisper torch を実行してください。"
+                "faster-whisper が見つかりません。\n"
+                "pip install faster-whisper torch を実行してください。"
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(str(e))
 
 
@@ -181,7 +203,7 @@ class ClipWorker(QThread):
                     "-c", "copy",
                     job["output"]
                 ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
                 if result.returncode != 0:
                     self.error.emit(f"クリップ失敗: {result.stderr}")
                     return
@@ -195,11 +217,100 @@ class ClipWorker(QThread):
 
 
 # ─────────────────────────────────────────────
+# ワーカースレッド: クリップ結合
+# ─────────────────────────────────────────────
+
+class MergeWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(str)  # 出力ファイルパス
+    error = pyqtSignal(str)
+
+    def __init__(self, video_path: str, segments: list, output_path: str, pre: float, post: float):
+        """
+        segments: [{"start": float, "end": float, ...}, ...]
+        """
+        super().__init__()
+        self.video_path = video_path
+        self.segments = segments
+        self.output_path = output_path
+        self.pre = pre
+        self.post = post
+
+    def run(self):
+        try:
+            import uuid
+
+            self.progress.emit(10, "クリップを抽出中...")
+
+            # 一時ディレクトリ
+            tmp_dir = "/tmp" if platform.system() != "Windows" else tempfile.gettempdir()
+            tmp_clips = []
+
+            # 各セグメントを一時ファイルに出力
+            total = len(self.segments)
+            for i, seg in enumerate(self.segments):
+                start = max(0, seg["start"] - self.pre)
+                end = seg["end"] + self.post
+                duration = end - start
+
+                tmp_clip = os.path.join(tmp_dir, f"clip_{uuid.uuid4().hex}.ts")
+                tmp_clips.append(tmp_clip)
+
+                cmd = [
+                    get_ffmpeg_path(), "-y",
+                    "-ss", str(start),
+                    "-i", self.video_path,
+                    "-t", str(duration),
+                    "-c", "copy",
+                    "-bsf:v", "h264_mp4toannexb",
+                    "-f", "mpegts",
+                    tmp_clip
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+                if result.returncode != 0:
+                    raise RuntimeError(f"クリップ抽出失敗: {result.stderr}")
+
+                pct = 10 + int((i + 1) / total * 50)
+                self.progress.emit(pct, f"クリップ {i+1}/{total} を抽出中...")
+
+            self.progress.emit(70, "クリップを結合中...")
+
+            # concatで結合
+            concat_input = "|".join(tmp_clips)
+            cmd = [
+                get_ffmpeg_path(), "-y",
+                "-i", f"concat:{concat_input}",
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                self.output_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode != 0:
+                raise RuntimeError(f"結合失敗: {result.stderr}")
+
+            # 一時ファイル削除
+            for tmp_clip in tmp_clips:
+                try:
+                    os.unlink(tmp_clip)
+                except:
+                    pass
+
+            self.progress.emit(100, "結合完了")
+            self.finished.emit(self.output_path)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
+# ─────────────────────────────────────────────
 # セグメントカードウィジェット
 # ─────────────────────────────────────────────
 
 class SegmentCard(QFrame):
     clip_requested = pyqtSignal(dict)  # segment data
+    selection_changed = pyqtSignal()   # 選択状態変更
 
     def __init__(self, segment: dict, highlight_word: str = ""):
         super().__init__()
@@ -211,6 +322,11 @@ class SegmentCard(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
+
+        # チェックボックス（結合用選択）
+        self._checkbox = QCheckBox()
+        self._checkbox.setFixedWidth(24)
+        self._checkbox.stateChanged.connect(lambda: self.selection_changed.emit())
 
         # タイムスタンプ
         start = self.segment["start"]
@@ -235,9 +351,16 @@ class SegmentCard(QFrame):
         clip_btn.setFixedWidth(72)
         clip_btn.clicked.connect(lambda: self.clip_requested.emit(self.segment))
 
+        layout.addWidget(self._checkbox)
         layout.addWidget(ts_label)
         layout.addWidget(text_label, 1)
         layout.addWidget(clip_btn)
+
+    def is_selected(self) -> bool:
+        return self._checkbox.isChecked()
+
+    def set_selected(self, selected: bool):
+        self._checkbox.setChecked(selected)
 
     def _fmt(self, seconds: float) -> str:
         m = int(seconds // 60)
@@ -278,6 +401,7 @@ class ClipFinderApp(QMainWindow):
         self._segments: list[dict] = []
         self._transcribe_worker = None
         self._clip_worker = None
+        self._merge_worker = None
 
         self._apply_stylesheet()
         self._build_ui()
@@ -684,6 +808,28 @@ class ClipFinderApp(QMainWindow):
         result_header.addWidget(clip_all_btn)
         sl.addLayout(result_header)
 
+        # 選択・結合コントロール
+        select_row = QHBoxLayout()
+        select_all_btn = QPushButton("全選択")
+        select_all_btn.setObjectName("SecondaryBtn")
+        select_all_btn.setFixedWidth(70)
+        select_all_btn.clicked.connect(self._select_all_segments)
+        deselect_btn = QPushButton("選択解除")
+        deselect_btn.setObjectName("SecondaryBtn")
+        deselect_btn.setFixedWidth(90)
+        deselect_btn.clicked.connect(self._deselect_all_segments)
+        self._selected_count_label = QLabel("選択: 0 件")
+        self._selected_count_label.setObjectName("SectionLabel")
+        merge_btn = QPushButton("選択を結合出力")
+        merge_btn.setObjectName("PrimaryBtn")
+        merge_btn.clicked.connect(self._merge_selected)
+        select_row.addWidget(select_all_btn)
+        select_row.addWidget(deselect_btn)
+        select_row.addWidget(self._selected_count_label)
+        select_row.addStretch()
+        select_row.addWidget(merge_btn)
+        sl.addLayout(select_row)
+
         # セグメントリスト（スクロール）
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -832,6 +978,7 @@ class ClipFinderApp(QMainWindow):
     def _add_segment_card(self, seg: dict, highlight: str = ""):
         card = SegmentCard(seg, highlight)
         card.clip_requested.connect(self._on_clip_requested)
+        card.selection_changed.connect(self._update_selection_count)
         # stretch前に挿入
         pos = self._segments_layout.count() - 1
         self._segments_layout.insertWidget(pos, card)
@@ -851,6 +998,7 @@ class ClipFinderApp(QMainWindow):
                 card.mark_matched()
                 matched += 1
             card.clip_requested.connect(self._on_clip_requested)
+            card.selection_changed.connect(self._update_selection_count)
             pos = self._segments_layout.count() - 1
             self._segments_layout.insertWidget(pos, card)
 
@@ -873,6 +1021,73 @@ class ClipFinderApp(QMainWindow):
             QMessageBox.information(self, "結果なし", "一致するセグメントがありません")
             return
         self._export_clips(matched)
+
+    def _get_segment_cards(self) -> list:
+        """全てのSegmentCardを取得"""
+        cards = []
+        for i in range(self._segments_layout.count()):
+            widget = self._segments_layout.itemAt(i).widget()
+            if isinstance(widget, SegmentCard):
+                cards.append(widget)
+        return cards
+
+    def _select_all_segments(self):
+        for card in self._get_segment_cards():
+            card.set_selected(True)
+        self._update_selection_count()
+
+    def _deselect_all_segments(self):
+        for card in self._get_segment_cards():
+            card.set_selected(False)
+        self._update_selection_count()
+
+    def _update_selection_count(self):
+        selected = sum(1 for card in self._get_segment_cards() if card.is_selected())
+        self._selected_count_label.setText(f"選択: {selected} 件")
+
+    def _merge_selected(self):
+        if not self._video_path:
+            QMessageBox.warning(self, "エラー", "動画ファイルを選択してください")
+            return
+
+        selected_cards = [card for card in self._get_segment_cards() if card.is_selected()]
+        if not selected_cards:
+            QMessageBox.warning(self, "エラー", "結合するセグメントを選択してください")
+            return
+
+        # 時間順にソート
+        selected_segments = sorted([card.segment for card in selected_cards], key=lambda s: s["start"])
+
+        # 出力パス決定
+        out_dir = self._out_dir_edit.text().strip()
+        if not out_dir:
+            out_dir = str(Path(self._video_path).parent)
+
+        ext = Path(self._video_path).suffix
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = str(Path(out_dir) / f"merged_{ts}{ext}")
+
+        pre = self._pre_spin.value()
+        post = self._post_spin.value()
+
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+
+        self._merge_worker = MergeWorker(self._video_path, selected_segments, out_path, pre, post)
+        self._merge_worker.progress.connect(lambda p, m: (
+            self._progress_bar.setValue(p),
+            self._progress_label.setText(m)
+        ))
+        self._merge_worker.finished.connect(self._on_merge_done)
+        self._merge_worker.error.connect(lambda e: QMessageBox.critical(self, "結合エラー", e))
+        self._merge_worker.start()
+
+    def _on_merge_done(self, path: str):
+        item = QListWidgetItem(f"[結合] {Path(path).name}")
+        item.setToolTip(path)
+        self._clip_list.insertItem(0, item)
+        self._statusbar.showMessage(f"結合完了: {Path(path).name}")
+        QTimer.singleShot(3000, lambda: self._progress_bar.setVisible(False))
 
     def _export_clips(self, segments: list):
         pre = self._pre_spin.value()

@@ -16,7 +16,7 @@ call build_venv\Scripts\activate
 
 echo 依存パッケージをインストール中...
 pip install --upgrade pip
-pip install pyinstaller PyQt6 openai-whisper ffmpeg-python
+pip install pyinstaller PyQt6 faster-whisper ffmpeg-python
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 REM FFmpegダウンロード

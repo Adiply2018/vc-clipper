@@ -6,10 +6,8 @@ from pathlib import Path
 
 block_cipher = None
 
-# Whisperのモデルアセットを含める
-import whisper
-whisper_path = Path(whisper.__file__).parent
-whisper_assets = [(str(whisper_path / "assets"), "whisper/assets")]
+# faster-whisperはモデルを自動ダウンロードするのでアセット不要
+whisper_assets = []
 
 # FFmpegバイナリ（存在する場合のみ）
 ffmpeg_binaries = []
@@ -28,9 +26,9 @@ a = Analysis(
         'PyQt6.QtCore',
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
-        'whisper',
+        'faster_whisper',
+        'ctranslate2',
         'torch',
-        'torchaudio',
         'ffmpeg',
     ],
     hookspath=[],

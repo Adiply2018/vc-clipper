@@ -31,7 +31,7 @@ if command -v uv &> /dev/null; then
         uv venv
     fi
     source .venv/bin/activate
-    uv pip install PyQt6 openai-whisper ffmpeg-python torch
+    uv pip install PyQt6 faster-whisper ffmpeg-python torch
 else
     echo "pipを使用して環境をセットアップ中..."
     if [ ! -d ".venv" ]; then
@@ -39,7 +39,7 @@ else
     fi
     source .venv/bin/activate
     pip install --upgrade pip -q
-    pip install PyQt6 openai-whisper ffmpeg-python torch -q
+    pip install PyQt6 faster-whisper ffmpeg-python torch -q
 fi
 
 echo ""

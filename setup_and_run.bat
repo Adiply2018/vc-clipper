@@ -34,7 +34,7 @@ REM 依存パッケージインストール
 echo パッケージをインストール中...
 call venv\Scripts\activate
 pip install --upgrade pip -q
-pip install PyQt6 openai-whisper ffmpeg-python -q
+pip install PyQt6 faster-whisper ffmpeg-python -q
 
 REM CUDA確認してtorchインストール
 python -c "import torch; print(torch.cuda.is_available())" >nul 2>&1
