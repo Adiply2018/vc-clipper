@@ -5,6 +5,7 @@ ClipFinder - ゲーム動画セリフクリッパー
 
 import sys
 import os
+from dotenv import load_dotenv
 
 # UTF-8を強制
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
@@ -18,6 +19,95 @@ import tempfile
 import platform
 from pathlib import Path
 from datetime import datetime
+
+
+# ─────────────────────────────────────────────
+# 環境変数の読み込み
+# ─────────────────────────────────────────────
+load_dotenv()
+
+# ─────────────────────────────────────────────
+# 定数
+# ─────────────────────────────────────────────
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+# ランダム話者名（SPEAKER_00の代わりにLoLチャンピオン名を使用）
+SPEAKER_NAMES = [
+    "Ahri", "Jinx", "Lux", "Yasuo", "Zed",
+    "Thresh", "Lee Sin", "Ezreal", "Kai'Sa", "Akali",
+    "Sett", "Yone", "Viego", "Garen", "Darius",
+    "Teemo", "Vayne", "Ashe", "Miss Fortune", "Caitlyn"
+]
+
+
+# ─────────────────────────────────────────────
+# 設定管理
+# ─────────────────────────────────────────────
+
+class ConfigManager:
+    """~/.clipfinder/config.json で設定を管理"""
+
+    def __init__(self):
+        self._config_dir = Path.home() / ".clipfinder"
+        self._config_file = self._config_dir / "config.json"
+        self._config = self._load()
+
+    def _load(self) -> dict:
+        if self._config_file.exists():
+            try:
+                with open(self._config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+
+    def _save(self):
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._config_file, "w", encoding="utf-8") as f:
+            json.dump(self._config, f, ensure_ascii=False, indent=2)
+
+    def get(self, key: str, default=None):
+        return self._config.get(key, default)
+
+    def set(self, key: str, value):
+        self._config[key] = value
+        self._save()
+
+    @property
+    def hf_token(self) -> str:
+        return self.get("hf_token", "")
+
+    @hf_token.setter
+    def hf_token(self, value: str):
+        self.set("hf_token", value)
+
+    @property
+    def diarization_enabled(self) -> bool:
+        return self.get("diarization_enabled", True)  # デフォルトON
+
+    @diarization_enabled.setter
+    def diarization_enabled(self, value: bool):
+        self.set("diarization_enabled", value)
+
+    @property
+    def speaker_labels(self) -> dict:
+        """話者ID -> カスタム名のマッピング"""
+        return self.get("speaker_labels", {})
+
+    @speaker_labels.setter
+    def speaker_labels(self, value: dict):
+        self.set("speaker_labels", value)
+
+    def get_speaker_label(self, speaker_id: str) -> str:
+        """話者IDのラベルを取得（カスタム名があればそれを、なければデフォルト）"""
+        labels = self.speaker_labels
+        return labels.get(speaker_id, speaker_id)
+
+    def set_speaker_label(self, speaker_id: str, label: str):
+        """話者IDにカスタムラベルを設定"""
+        labels = self.speaker_labels
+        labels[speaker_id] = label
+        self.speaker_labels = labels
 
 
 def get_ffmpeg_path() -> str:
@@ -170,6 +260,100 @@ class TranscribeWorker(QThread):
 
 
 # ─────────────────────────────────────────────
+# ワーカースレッド: 話者分離
+# ─────────────────────────────────────────────
+
+class DiarizationWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)  # [(start, end, speaker_id), ...]
+    error = pyqtSignal(str)
+
+    def __init__(self, audio_path: str, hf_token: str, min_speakers: int = None, max_speakers: int = None):
+        super().__init__()
+        self.audio_path = audio_path
+        self.hf_token = hf_token
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            import torch
+            from pyannote.audio import Pipeline
+
+            self.progress.emit(10, "話者分離モデルを読み込み中...")
+
+            # HF_TOKEN環境変数を設定（pyannote-audio 3.1+で必要）
+            if self.hf_token:
+                os.environ["HF_TOKEN"] = self.hf_token
+
+            # GPU/CPU自動選択
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # pyannote-audioパイプライン
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=self.hf_token
+            )
+            pipeline.to(device)
+
+            if self._cancelled:
+                return
+
+            self.progress.emit(30, "話者分離を実行中...")
+
+            # 話者数のヒントを設定
+            diarization_params = {}
+            if self.min_speakers is not None:
+                diarization_params["min_speakers"] = self.min_speakers
+            if self.max_speakers is not None:
+                diarization_params["max_speakers"] = self.max_speakers
+
+            # 話者分離実行
+            diarization = pipeline(self.audio_path, **diarization_params)
+
+            if self._cancelled:
+                return
+
+            self.progress.emit(80, "話者情報を抽出中...")
+
+            # 結果を抽出
+            segments = []
+            for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
+                segments.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker
+                })
+
+            self.progress.emit(100, "話者分離完了")
+            self.finished.emit(segments)
+
+        except ImportError as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(
+                "pyannote.audio が見つかりません。\n"
+                "pip install pyannote.audio を実行してください。"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_msg = str(e)
+            if "401" in error_msg or "authentication" in error_msg.lower():
+                self.error.emit(
+                    "HuggingFace認証エラー:\n"
+                    "1. トークンが正しいか確認してください\n"
+                    "2. https://huggingface.co/pyannote/speaker-diarization-3.1 で利用規約に同意してください"
+                )
+            else:
+                self.error.emit(error_msg)
+
+
+# ─────────────────────────────────────────────
 # ワーカースレッド: クリップ出力
 # ─────────────────────────────────────────────
 
@@ -191,7 +375,7 @@ class ClipWorker(QThread):
             total = len(self.jobs)
             for i, job in enumerate(self.jobs):
                 self.progress.emit(
-                    int(i / total * 100),
+                    int((i + 1) / total * 100),
                     f"クリップ {i+1}/{total} を出力中..."
                 )
                 duration = job["end"] - job["start"]
@@ -305,6 +489,290 @@ class MergeWorker(QThread):
 
 
 # ─────────────────────────────────────────────
+# ワーカースレッド: 文字起こし＋話者分離統合
+# ─────────────────────────────────────────────
+
+class CombinedTranscribeWorker(QThread):
+    """
+    TranscribeWorkerとDiarizationWorkerを並列実行し、
+    結果をマージしてセグメントに話者情報を付与する
+    """
+    progress = pyqtSignal(int, str)
+    segment_ready = pyqtSignal(dict)
+    diarization_started = pyqtSignal()  # 話者分離開始を通知
+    finished = pyqtSignal(list, list)  # (segments, speakers)
+    error = pyqtSignal(str)
+
+    def __init__(self, video_path: str, model_size: str, language: str = "ja",
+                 enable_diarization: bool = False, hf_token: str = "",
+                 min_speakers: int = None, max_speakers: int = None):
+        super().__init__()
+        self.video_path = video_path
+        self.model_size = model_size
+        self.language = language
+        self.enable_diarization = enable_diarization
+        self.hf_token = hf_token
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self._cancelled = False
+
+        # 結果保存用
+        self._transcribe_segments = []
+        self._diarization_segments = []
+        self._transcribe_done = False
+        self._diarization_done = False
+        self._audio_path = None
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            import torch
+            import numpy as np
+            import wave
+            import uuid
+
+            self.progress.emit(5, "音声を抽出中...")
+
+            # 一時WAVファイルに音声抽出
+            tmp_dir = "/tmp" if platform.system() != "Windows" else tempfile.gettempdir()
+            self._audio_path = os.path.join(tmp_dir, f"clipfinder_{uuid.uuid4().hex}.wav")
+
+            cmd = [
+                get_ffmpeg_path(), "-y", "-i", self.video_path,
+                "-vn", "-acodec", "pcm_s16le",
+                "-ar", "16000", "-ac", "1",
+                self._audio_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode != 0:
+                raise RuntimeError(f"FFmpeg エラー: {result.stderr}")
+
+            if self._cancelled:
+                self._cleanup()
+                return
+
+            # 音声データを読み込み
+            with wave.open(self._audio_path, 'rb') as wf:
+                audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                audio_float = audio_data.astype(np.float32) / 32768.0
+
+            # 文字起こし実行
+            self.progress.emit(20, "音声認識モデルを読み込み中...")
+            transcribe_segments = self._run_transcribe(audio_float, torch)
+
+            if self._cancelled:
+                self._cleanup()
+                return
+
+            # 話者分離実行（有効な場合）
+            diarization_segments = []
+            speakers = []
+            speaker_name_map = {}
+            if self.enable_diarization and self.hf_token:
+                self.diarization_started.emit()  # 話者分離開始を通知
+                self.progress.emit(60, "話者分離を実行中...")
+                diarization_segments = self._run_diarization(torch)
+                if diarization_segments:
+                    # 話者IDを抽出してランダムな名前にマッピング
+                    import random
+                    raw_speakers = list(set(s["speaker"] for s in diarization_segments))
+                    raw_speakers.sort()
+                    available_names = SPEAKER_NAMES.copy()
+                    random.shuffle(available_names)
+                    for i, spk in enumerate(raw_speakers):
+                        if i < len(available_names):
+                            speaker_name_map[spk] = available_names[i]
+                        else:
+                            speaker_name_map[spk] = f"話者{i+1}"
+                    # diarization_segmentsの話者名を置換
+                    for seg in diarization_segments:
+                        seg["speaker"] = speaker_name_map.get(seg["speaker"], seg["speaker"])
+                    speakers = [speaker_name_map[spk] for spk in raw_speakers]
+
+            if self._cancelled:
+                self._cleanup()
+                return
+
+            # 結果をマージ
+            self.progress.emit(90, "結果を統合中...")
+            merged_segments = self._merge_results(transcribe_segments, diarization_segments)
+
+            self._cleanup()
+
+            self.progress.emit(100, "完了")
+            self.finished.emit(merged_segments, speakers)
+
+        except ImportError as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(
+                "必要なパッケージが見つかりません。\n"
+                "pip install faster-whisper torch pyannote.audio を実行してください。"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self._cleanup()
+
+    def _run_transcribe(self, audio_float, torch):
+        """faster-whisperで文字起こし"""
+        from faster_whisper import WhisperModel
+
+        # GPU/CPU自動選択
+        if torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "float16"
+        else:
+            device = "cpu"
+            compute_type = "int8"
+
+        actual_model = self.model_size
+        if self.model_size == "auto":
+            actual_model = "large-v3" if torch.cuda.is_available() else "medium"
+
+        self.progress.emit(30, f"Whisper {actual_model} ({device}) で認識中...")
+
+        model = WhisperModel(actual_model, device=device, compute_type=compute_type)
+
+        segment_generator, info = model.transcribe(
+            audio_float,
+            language=self.language,
+            word_timestamps=True,
+            vad_filter=True,
+        )
+
+        segments = []
+        for i, seg in enumerate(segment_generator):
+            if self._cancelled:
+                break
+            segment_data = {
+                "id": i,
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text.strip(),
+                "speaker": None,  # 話者分離で後から設定
+            }
+            segments.append(segment_data)
+            self.segment_ready.emit(segment_data)
+            # セグメント総数が不明なため、進捗メッセージのみ更新（進捗値は固定）
+            self.progress.emit(45, f"認識中... {i+1} セグメント")
+
+        return segments
+
+    def _run_diarization(self, torch):
+        """pyannote-audioで話者分離"""
+        try:
+            from pyannote.audio import Pipeline
+
+            # HF_TOKEN環境変数を設定（pyannote-audio 3.1+で必要）
+            if self.hf_token:
+                os.environ["HF_TOKEN"] = self.hf_token
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=self.hf_token
+            )
+            pipeline.to(device)
+
+            diarization_params = {}
+            if self.min_speakers is not None:
+                diarization_params["min_speakers"] = self.min_speakers
+            if self.max_speakers is not None:
+                diarization_params["max_speakers"] = self.max_speakers
+
+            diarization = pipeline(self._audio_path, **diarization_params)
+
+            segments = []
+            for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
+                segments.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker
+                })
+
+            return segments
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_msg = str(e)
+            if "401" in error_msg or "authentication" in error_msg.lower():
+                self.progress.emit(70, "話者分離: 認証エラー（スキップ）")
+            else:
+                self.progress.emit(70, f"話者分離エラー: {error_msg[:50]}")
+            return []
+
+    def _merge_results(self, transcribe_segments: list, diarization_segments: list) -> list:
+        """文字起こしセグメントに話者情報を付与"""
+        if not diarization_segments:
+            return transcribe_segments
+
+        for seg in transcribe_segments:
+            seg_mid = (seg["start"] + seg["end"]) / 2
+
+            # セグメントの中央時間が含まれる話者区間を探す
+            best_speaker = None
+            best_overlap = 0
+
+            for d_seg in diarization_segments:
+                # オーバーラップを計算
+                overlap_start = max(seg["start"], d_seg["start"])
+                overlap_end = min(seg["end"], d_seg["end"])
+                overlap = max(0, overlap_end - overlap_start)
+
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = d_seg["speaker"]
+
+            seg["speaker"] = best_speaker
+
+        return transcribe_segments
+
+    def _cleanup(self):
+        """一時ファイルを削除"""
+        if self._audio_path and os.path.exists(self._audio_path):
+            try:
+                os.unlink(self._audio_path)
+            except:
+                pass
+
+
+# ─────────────────────────────────────────────
+# 話者カラー管理
+# ─────────────────────────────────────────────
+
+SPEAKER_COLORS = [
+    "#FF6B6B",  # Red
+    "#4ECDC4",  # Teal
+    "#45B7D1",  # Blue
+    "#96CEB4",  # Green
+    "#FFEAA7",  # Yellow
+    "#DDA0DD",  # Plum
+    "#98D8C8",  # Mint
+    "#F7DC6F",  # Gold
+    "#BB8FCE",  # Purple
+    "#85C1E9",  # Light Blue
+]
+
+
+def get_speaker_color(speaker_id: str, speakers: list) -> str:
+    """話者IDに対応する色を返す"""
+    if not speaker_id or not speakers:
+        return "#6050b8"  # デフォルト色
+    try:
+        idx = speakers.index(speaker_id)
+        return SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
+    except ValueError:
+        return "#6050b8"
+
+
+# ─────────────────────────────────────────────
 # セグメントカードウィジェット
 # ─────────────────────────────────────────────
 
@@ -312,10 +780,14 @@ class SegmentCard(QFrame):
     clip_requested = pyqtSignal(dict)  # segment data
     selection_changed = pyqtSignal()   # 選択状態変更
 
-    def __init__(self, segment: dict, highlight_word: str = ""):
+    def __init__(self, segment: dict, highlight_word: str = "", speakers: list = None, config: ConfigManager = None, diarization_pending: bool = False):
         super().__init__()
         self.segment = segment
+        self._speakers = speakers or []
+        self._config = config
+        self._diarization_pending = diarization_pending
         self.setObjectName("SegmentCard")
+        self._speaker_label = None
         self._setup_ui(highlight_word)
 
     def _setup_ui(self, highlight_word: str):
@@ -327,6 +799,45 @@ class SegmentCard(QFrame):
         self._checkbox = QCheckBox()
         self._checkbox.setFixedWidth(24)
         self._checkbox.stateChanged.connect(lambda: self.selection_changed.emit())
+
+        # 話者ラベル（話者分離が有効な場合のみ表示）
+        speaker = self.segment.get("speaker")
+        if self._diarization_pending:
+            # 話者分離中のローディング表示
+            speaker_label = QLabel("分離中...")
+            speaker_label.setObjectName("SpeakerLabel")
+            speaker_label.setFixedWidth(70)
+            speaker_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            speaker_label.setStyleSheet("""
+                QLabel {
+                    background: #3a3a5c;
+                    color: #888;
+                    border-radius: 4px;
+                    padding: 2px 6px;
+                    font-size: 11px;
+                    font-style: italic;
+                }
+            """)
+            self._speaker_label = speaker_label
+        elif speaker and self._speakers:
+            color = get_speaker_color(speaker, self._speakers)
+            label_text = self._config.get_speaker_label(speaker) if self._config else speaker
+            speaker_label = QLabel(label_text)
+            speaker_label.setObjectName("SpeakerLabel")
+            speaker_label.setFixedWidth(70)
+            speaker_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            speaker_label.setStyleSheet(f"""
+                QLabel {{
+                    background: {color};
+                    color: #1a1a2e;
+                    border-radius: 4px;
+                    padding: 2px 6px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }}
+            """)
+        else:
+            speaker_label = None
 
         # タイムスタンプ
         start = self.segment["start"]
@@ -352,6 +863,8 @@ class SegmentCard(QFrame):
         clip_btn.clicked.connect(lambda: self.clip_requested.emit(self.segment))
 
         layout.addWidget(self._checkbox)
+        if speaker_label:
+            layout.addWidget(speaker_label)
         layout.addWidget(ts_label)
         layout.addWidget(text_label, 1)
         layout.addWidget(clip_btn)
@@ -399,13 +912,18 @@ class ClipFinderApp(QMainWindow):
 
         self._video_path = ""
         self._segments: list[dict] = []
+        self._speakers: list[str] = []  # 検出された話者リスト
+        self._speaker_filter: str = None  # 現在の話者フィルタ（Noneは全て表示）
+        self._diarization_pending: bool = False  # 話者分離中フラグ
         self._transcribe_worker = None
         self._clip_worker = None
         self._merge_worker = None
+        self._config = ConfigManager()
 
         self._apply_stylesheet()
         self._build_ui()
         self._setup_statusbar()
+        self._load_settings()
 
     # ── スタイル ──────────────────────────────
 
@@ -711,6 +1229,39 @@ class ClipFinderApp(QMainWindow):
 
         layout.addWidget(settings_group)
 
+        # ── 話者分離設定 ─────────────────────────
+        diarization_group = QGroupBox("話者分離")
+        dg_layout = QVBoxLayout(diarization_group)
+
+        # 話者分離ON/OFFトグル
+        self._diarization_check = QCheckBox("話者分離を有効にする")
+        self._diarization_check.stateChanged.connect(self._on_diarization_toggled)
+        dg_layout.addWidget(self._diarization_check)
+
+        # 話者数ヒント
+        speakers_row = QHBoxLayout()
+        speakers_row.addWidget(QLabel("話者数"))
+        self._min_speakers_spin = QSpinBox()
+        self._min_speakers_spin.setRange(0, 20)
+        self._min_speakers_spin.setValue(0)
+        self._min_speakers_spin.setSpecialValueText("自動")
+        self._min_speakers_spin.setToolTip("最小話者数（0=自動）")
+        speakers_row.addWidget(self._min_speakers_spin)
+        speakers_row.addWidget(QLabel("〜"))
+        self._max_speakers_spin = QSpinBox()
+        self._max_speakers_spin.setRange(0, 20)
+        self._max_speakers_spin.setValue(2)  # デフォルト2
+        self._max_speakers_spin.setSpecialValueText("自動")
+        self._max_speakers_spin.setToolTip("最大話者数（0=自動）")
+        speakers_row.addWidget(self._max_speakers_spin)
+        dg_layout.addLayout(speakers_row)
+
+        # 初期状態で話者分離設定を無効化
+        self._min_speakers_spin.setEnabled(False)
+        self._max_speakers_spin.setEnabled(False)
+
+        layout.addWidget(diarization_group)
+
         # ── クリップ設定 ──────────────────────
         clip_group = QGroupBox("クリップ設定")
         cg_layout = QVBoxLayout(clip_group)
@@ -808,6 +1359,27 @@ class ClipFinderApp(QMainWindow):
         result_header.addWidget(clip_all_btn)
         sl.addLayout(result_header)
 
+        # 話者フィルタ行（話者分離有効時のみ表示）
+        self._speaker_filter_widget = QWidget()
+        speaker_filter_layout = QHBoxLayout(self._speaker_filter_widget)
+        speaker_filter_layout.setContentsMargins(0, 0, 0, 0)
+        speaker_filter_layout.setSpacing(4)
+        speaker_filter_label = QLabel("話者:")
+        speaker_filter_label.setObjectName("SectionLabel")
+        speaker_filter_layout.addWidget(speaker_filter_label)
+        self._speaker_filter_buttons_layout = QHBoxLayout()
+        self._speaker_filter_buttons_layout.setSpacing(4)
+        speaker_filter_layout.addLayout(self._speaker_filter_buttons_layout)
+        speaker_filter_layout.addStretch()
+        # 「この話者のみクリップ」ボタン
+        self._clip_speaker_btn = QPushButton("この話者のみクリップ")
+        self._clip_speaker_btn.setObjectName("SecondaryBtn")
+        self._clip_speaker_btn.clicked.connect(self._clip_filtered_speaker)
+        self._clip_speaker_btn.setVisible(False)
+        speaker_filter_layout.addWidget(self._clip_speaker_btn)
+        self._speaker_filter_widget.setVisible(False)
+        sl.addWidget(self._speaker_filter_widget)
+
         # 選択・結合コントロール
         select_row = QHBoxLayout()
         select_all_btn = QPushButton("全選択")
@@ -874,6 +1446,18 @@ class ClipFinderApp(QMainWindow):
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("動画ファイルを選択してください")
 
+    def _load_settings(self):
+        """設定を読み込んでUIに反映"""
+        self._diarization_check.setChecked(self._config.diarization_enabled)
+        self._on_diarization_toggled()
+
+    def _on_diarization_toggled(self):
+        """話者分離の有効/無効切り替え"""
+        enabled = self._diarization_check.isChecked()
+        self._min_speakers_spin.setEnabled(enabled)
+        self._max_speakers_spin.setEnabled(enabled)
+        self._config.diarization_enabled = enabled
+
     # ── イベントハンドラ ──────────────────────
 
     def _select_video(self):
@@ -892,7 +1476,10 @@ class ClipFinderApp(QMainWindow):
         self._drop_label.setToolTip(path)
         self._statusbar.showMessage(f"読み込み: {name}")
         self._segments = []
+        self._speakers = []
+        self._speaker_filter = None
         self._clear_segments_ui()
+        self._clear_speaker_filter_buttons()
         self._full_text.clear()
 
     def _select_output_dir(self):
@@ -914,7 +1501,10 @@ class ClipFinderApp(QMainWindow):
             lang = None
 
         self._segments = []
+        self._speakers = []
+        self._speaker_filter = None
         self._clear_segments_ui()
+        self._clear_speaker_filter_buttons()
         self._full_text.clear()
         self._result_count_label.setText("認識結果: 0 件")
 
@@ -924,18 +1514,30 @@ class ClipFinderApp(QMainWindow):
         self._transcribe_btn.setEnabled(False)
         self._cancel_btn.setVisible(True)
 
-        self._transcribe_worker = TranscribeWorker(
-            self._video_path, model_key, lang or "ja"
+        # 話者分離オプション
+        enable_diarization = self._diarization_check.isChecked()
+        min_speakers = self._min_speakers_spin.value() if self._min_speakers_spin.value() > 0 else None
+        max_speakers = self._max_speakers_spin.value() if self._max_speakers_spin.value() > 0 else None
+
+        self._transcribe_worker = CombinedTranscribeWorker(
+            self._video_path, model_key, lang or "ja",
+            enable_diarization=enable_diarization,
+            hf_token=HF_TOKEN,  # 固定トークン使用
+            min_speakers=min_speakers,
+            max_speakers=max_speakers
         )
+        self._diarization_pending = enable_diarization  # 話者分離待ちフラグ
         self._transcribe_worker.progress.connect(self._on_transcribe_progress)
         self._transcribe_worker.segment_ready.connect(self._on_segment_ready)
-        self._transcribe_worker.finished.connect(self._on_transcribe_done)
+        self._transcribe_worker.diarization_started.connect(self._on_diarization_started)
+        self._transcribe_worker.finished.connect(self._on_transcribe_done_with_speakers)
         self._transcribe_worker.error.connect(self._on_transcribe_error)
         self._transcribe_worker.start()
 
     def _cancel_transcribe(self):
         if self._transcribe_worker:
             self._transcribe_worker.cancel()
+        self._diarization_pending = False
         self._on_transcribe_reset()
         self._statusbar.showMessage("認識をキャンセルしました")
 
@@ -945,8 +1547,16 @@ class ClipFinderApp(QMainWindow):
 
     def _on_segment_ready(self, seg: dict):
         self._segments.append(seg)
-        self._add_segment_card(seg)
+        self._add_segment_card(seg, diarization_pending=False)  # まだ話者分離前
         self._result_count_label.setText(f"認識結果: {len(self._segments)} 件")
+
+    def _on_diarization_started(self):
+        """話者分離が開始されたら、既存のセグメントカードを更新"""
+        self._diarization_pending = True
+        # 既存のセグメントカードを再構築して「分離中...」表示に
+        self._clear_segments_ui()
+        for seg in self._segments:
+            self._add_segment_card(seg, diarization_pending=True)
 
     def _on_transcribe_done(self, segments: list):
         self._segments = segments
@@ -956,6 +1566,39 @@ class ClipFinderApp(QMainWindow):
         self._full_text.setPlainText(full)
         self._on_transcribe_reset()
         self._statusbar.showMessage(f"認識完了: {len(segments)} セグメント")
+
+    def _on_transcribe_done_with_speakers(self, segments: list, speakers: list):
+        """話者情報付きの認識完了ハンドラ"""
+        self._diarization_pending = False  # 話者分離完了
+        self._segments = segments
+        self._speakers = speakers
+
+        # 全文表示（話者情報付き）
+        lines = []
+        for s in segments:
+            speaker_str = f"[{s.get('speaker', '?')}] " if s.get('speaker') else ""
+            lines.append(f"[{self._fmt_time(s['start'])}] {speaker_str}{s['text']}")
+        self._full_text.setPlainText("\n".join(lines))
+
+        # セグメントカードを再構築
+        self._clear_segments_ui()
+        for seg in segments:
+            self._add_segment_card(seg)
+
+        # 話者フィルタボタンを構築
+        if speakers:
+            self._build_speaker_filter_buttons()
+            self._speaker_filter_widget.setVisible(True)
+        else:
+            self._speaker_filter_widget.setVisible(False)
+
+        self._result_count_label.setText(f"認識結果: {len(segments)} 件")
+        self._on_transcribe_reset()
+
+        status_msg = f"認識完了: {len(segments)} セグメント"
+        if speakers:
+            status_msg += f", {len(speakers)} 話者検出"
+        self._statusbar.showMessage(status_msg)
 
     def _on_transcribe_error(self, msg: str):
         QMessageBox.critical(self, "認識エラー", msg)
@@ -975,26 +1618,144 @@ class ClipFinderApp(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-    def _add_segment_card(self, seg: dict, highlight: str = ""):
-        card = SegmentCard(seg, highlight)
+    def _add_segment_card(self, seg: dict, highlight: str = "", diarization_pending: bool = False):
+        # 話者フィルタが有効な場合、該当しないセグメントはスキップ
+        if self._speaker_filter and seg.get("speaker") != self._speaker_filter:
+            return
+
+        card = SegmentCard(seg, highlight, speakers=self._speakers, config=self._config, diarization_pending=diarization_pending)
         card.clip_requested.connect(self._on_clip_requested)
         card.selection_changed.connect(self._update_selection_count)
         # stretch前に挿入
         pos = self._segments_layout.count() - 1
         self._segments_layout.insertWidget(pos, card)
 
-    def _do_search(self):
-        query = self._search_edit.text().strip()
-        if not query:
-            return
+    def _clear_speaker_filter_buttons(self):
+        """話者フィルタボタンをクリア"""
+        while self._speaker_filter_buttons_layout.count() > 0:
+            item = self._speaker_filter_buttons_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._speaker_filter_widget.setVisible(False)
+        self._clip_speaker_btn.setVisible(False)
 
-        # 既存カードを再構築（ハイライト反映）
+    def _build_speaker_filter_buttons(self):
+        """話者フィルタボタンを構築"""
+        self._clear_speaker_filter_buttons()
+
+        # 「全て」ボタン
+        all_btn = QPushButton("全て")
+        all_btn.setObjectName("SpeakerFilterBtn")
+        all_btn.setCheckable(True)
+        all_btn.setChecked(True)
+        all_btn.setStyleSheet(self._get_speaker_btn_style(None, checked=True))
+        all_btn.clicked.connect(lambda: self._on_speaker_filter_clicked(None))
+        self._speaker_filter_buttons_layout.addWidget(all_btn)
+
+        # 各話者ボタン
+        for speaker in self._speakers:
+            color = get_speaker_color(speaker, self._speakers)
+            label = self._config.get_speaker_label(speaker)
+            btn = QPushButton(label)
+            btn.setObjectName("SpeakerFilterBtn")
+            btn.setCheckable(True)
+            btn.setStyleSheet(self._get_speaker_btn_style(color, checked=False))
+            btn.clicked.connect(lambda checked, s=speaker: self._on_speaker_filter_clicked(s))
+            self._speaker_filter_buttons_layout.addWidget(btn)
+
+    def _get_speaker_btn_style(self, color: str, checked: bool) -> str:
+        """話者フィルタボタンのスタイルを生成"""
+        if color:
+            if checked:
+                return f"""
+                    QPushButton {{
+                        background: {color};
+                        color: #1a1a2e;
+                        border: 2px solid {color};
+                        border-radius: 4px;
+                        padding: 4px 8px;
+                        font-weight: 600;
+                    }}
+                """
+            else:
+                return f"""
+                    QPushButton {{
+                        background: transparent;
+                        color: {color};
+                        border: 1px solid {color};
+                        border-radius: 4px;
+                        padding: 4px 8px;
+                    }}
+                    QPushButton:hover {{
+                        background: {color}40;
+                    }}
+                """
+        else:
+            # 「全て」ボタン
+            if checked:
+                return """
+                    QPushButton {
+                        background: #6040c0;
+                        color: white;
+                        border: none;
+                        border-radius: 4px;
+                        padding: 4px 8px;
+                        font-weight: 600;
+                    }
+                """
+            else:
+                return """
+                    QPushButton {
+                        background: transparent;
+                        color: #b0a0ff;
+                        border: 1px solid #3d3060;
+                        border-radius: 4px;
+                        padding: 4px 8px;
+                    }
+                    QPushButton:hover {
+                        background: #261e50;
+                    }
+                """
+
+    def _on_speaker_filter_clicked(self, speaker: str):
+        """話者フィルタボタンがクリックされた"""
+        self._speaker_filter = speaker
+
+        # ボタンの見た目を更新
+        for i in range(self._speaker_filter_buttons_layout.count()):
+            btn = self._speaker_filter_buttons_layout.itemAt(i).widget()
+            if btn:
+                if i == 0:  # 「全て」ボタン
+                    checked = speaker is None
+                    btn.setStyleSheet(self._get_speaker_btn_style(None, checked))
+                else:
+                    s = self._speakers[i - 1]
+                    color = get_speaker_color(s, self._speakers)
+                    checked = s == speaker
+                    btn.setStyleSheet(self._get_speaker_btn_style(color, checked))
+
+        # 「この話者のみクリップ」ボタンの表示切り替え
+        self._clip_speaker_btn.setVisible(speaker is not None)
+
+        # セグメントカードを再構築
+        self._rebuild_segment_cards()
+
+    def _rebuild_segment_cards(self):
+        """現在のフィルタ設定でセグメントカードを再構築"""
+        query = self._search_edit.text().strip()
         self._clear_segments_ui()
 
         matched = 0
+        displayed = 0
         for seg in self._segments:
-            card = SegmentCard(seg, query if query.lower() in seg["text"].lower() else "")
-            if query.lower() in seg["text"].lower():
+            # 話者フィルタ
+            if self._speaker_filter and seg.get("speaker") != self._speaker_filter:
+                continue
+
+            displayed += 1
+            highlight = query if query and query.lower() in seg["text"].lower() else ""
+            card = SegmentCard(seg, highlight, speakers=self._speakers, config=self._config)
+            if highlight:
                 card.mark_matched()
                 matched += 1
             card.clip_requested.connect(self._on_clip_requested)
@@ -1002,9 +1763,62 @@ class ClipFinderApp(QMainWindow):
             pos = self._segments_layout.count() - 1
             self._segments_layout.insertWidget(pos, card)
 
-        self._result_count_label.setText(
-            f"認識結果: {len(self._segments)} 件 / 一致: {matched} 件"
-        )
+        # 結果ラベル更新
+        if self._speaker_filter:
+            label_text = f"表示: {displayed} 件 / 全 {len(self._segments)} 件"
+        else:
+            label_text = f"認識結果: {len(self._segments)} 件"
+        if matched > 0:
+            label_text += f" / 一致: {matched} 件"
+        self._result_count_label.setText(label_text)
+
+    def _clip_filtered_speaker(self):
+        """現在フィルタ中の話者のセグメントを全てクリップ"""
+        if not self._speaker_filter or not self._video_path:
+            return
+
+        speaker_segments = [s for s in self._segments if s.get("speaker") == self._speaker_filter]
+        if not speaker_segments:
+            QMessageBox.information(self, "情報", "該当するセグメントがありません")
+            return
+
+        self._export_clips(speaker_segments)
+
+    def _do_search(self):
+        query = self._search_edit.text().strip()
+        if not query:
+            # 検索クエリがない場合は_rebuild_segment_cardsを使用
+            self._rebuild_segment_cards()
+            return
+
+        # 既存カードを再構築（ハイライト反映 + 話者フィルタ）
+        self._clear_segments_ui()
+
+        matched = 0
+        displayed = 0
+        for seg in self._segments:
+            # 話者フィルタ
+            if self._speaker_filter and seg.get("speaker") != self._speaker_filter:
+                continue
+
+            displayed += 1
+            is_match = query.lower() in seg["text"].lower()
+            highlight = query if is_match else ""
+            card = SegmentCard(seg, highlight, speakers=self._speakers, config=self._config)
+            if is_match:
+                card.mark_matched()
+                matched += 1
+            card.clip_requested.connect(self._on_clip_requested)
+            card.selection_changed.connect(self._update_selection_count)
+            pos = self._segments_layout.count() - 1
+            self._segments_layout.insertWidget(pos, card)
+
+        # 結果ラベル更新
+        if self._speaker_filter:
+            label_text = f"表示: {displayed} 件 / 全 {len(self._segments)} 件 / 一致: {matched} 件"
+        else:
+            label_text = f"認識結果: {len(self._segments)} 件 / 一致: {matched} 件"
+        self._result_count_label.setText(label_text)
         self._statusbar.showMessage(f'「{query}」で {matched} 件ヒット')
 
     def _on_clip_requested(self, seg: dict):
@@ -1016,7 +1830,15 @@ class ClipFinderApp(QMainWindow):
         query = self._search_edit.text().strip()
         if not query or not self._segments:
             return
-        matched = [s for s in self._segments if query.lower() in s["text"].lower()]
+
+        # 話者フィルタも考慮
+        matched = []
+        for s in self._segments:
+            if self._speaker_filter and s.get("speaker") != self._speaker_filter:
+                continue
+            if query.lower() in s["text"].lower():
+                matched.append(s)
+
         if not matched:
             QMessageBox.information(self, "結果なし", "一致するセグメントがありません")
             return

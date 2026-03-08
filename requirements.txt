@@ -2,3 +2,5 @@ PyQt6>=6.5.0
 faster-whisper>=1.0.0
 torch>=2.0.0
 ffmpeg-python>=0.2.0
+pyannote.audio>=3.1.0
+python-dotenv>=1.0.0

@@ -12,10 +12,17 @@ whisper_assets = []
 # FFmpegバイナリ（存在する場合のみ）
 ffmpeg_binaries = []
 ffmpeg_dir = Path("ffmpeg")
-if (ffmpeg_dir / "ffmpeg.exe").exists():
-    ffmpeg_binaries.append((str(ffmpeg_dir / "ffmpeg.exe"), "ffmpeg"))
-if (ffmpeg_dir / "ffprobe.exe").exists():
-    ffmpeg_binaries.append((str(ffmpeg_dir / "ffprobe.exe"), "ffmpeg"))
+
+# プラットフォームに応じたバイナリ名を決定
+if sys.platform == "win32":
+    ffmpeg_name, ffprobe_name = "ffmpeg.exe", "ffprobe.exe"
+else:
+    ffmpeg_name, ffprobe_name = "ffmpeg", "ffprobe"
+
+if (ffmpeg_dir / ffmpeg_name).exists():
+    ffmpeg_binaries.append((str(ffmpeg_dir / ffmpeg_name), "ffmpeg"))
+if (ffmpeg_dir / ffprobe_name).exists():
+    ffmpeg_binaries.append((str(ffmpeg_dir / ffprobe_name), "ffmpeg"))
 
 a = Analysis(
     ['app.py'],

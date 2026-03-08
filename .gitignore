@@ -23,3 +23,7 @@ ffmpeg_temp/
 .idea/
 .vscode/
 *.swp
+
+# Environment variables
+.env
+.env.local
